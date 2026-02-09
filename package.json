@@ -14,7 +14,9 @@
     "docx": "^9.5.1",
     "pdfmake": "^0.2.10",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^6.26.2",
+    "tesseract.js": "^5.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

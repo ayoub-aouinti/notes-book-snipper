@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
+import { NavLink, Route, Routes } from 'react-router-dom'
 import pdfMake from 'pdfmake/build/pdfmake'
 import pdfFonts from 'pdfmake/build/vfs_fonts'
 import { AlignmentType, Document, HeadingLevel, Packer, Paragraph, TextRun } from 'docx'
+import Tesseract from 'tesseract.js'
 import './App.css'
 import { supabase } from './supabase'
 
@@ -43,8 +45,7 @@ function App() {
   const [isRegisterMode, setIsRegisterMode] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
 
-  const ocrApiKey = import.meta.env.VITE_GOOGLE_VISION_API_KEY as string | undefined
-  const ocrProxyUrl = import.meta.env.VITE_OCR_PROXY_URL as string | undefined
+  const [ocrProgress, setOcrProgress] = useState<number | null>(null)
 
   useEffect(() => {
     if (!supabase) {
@@ -123,7 +124,7 @@ function App() {
 
   const canSave = text.trim().length > 0
 
-  const handleImagePick = (file?: File | null) => {
+  const handleImagePick = async (file?: File | null) => {
     if (!file) return
     setSourceImage(file.name)
     setSourceImageFile(file)
@@ -132,6 +133,7 @@ function App() {
     if (!text.trim()) {
       setText('نسخة أولية من النص بعد OCR. يمكنك تصحيحها هنا...')
     }
+    await runOcrWithFile(file)
   }
 
   const resetDraft = () => {
@@ -385,62 +387,73 @@ function App() {
       reader.readAsDataURL(file)
     })
 
-  const runOcr = async () => {
-    if (!sourceImageFile) return
+  const runOcrWithFile = async (file: File) => {
     setOcrStatus('loading')
     setOcrError(null)
 
     try {
-      const base64 = await fileToBase64(sourceImageFile)
-      let textResult = ''
-
-      if (ocrProxyUrl) {
-        const response = await fetch(ocrProxyUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64: base64, languageHint: 'ar' }),
-        })
-        const payload = await response.json()
-        textResult = payload.text || ''
-      } else {
-        if (!ocrApiKey) {
-          throw new Error('أضف مفتاح Google Vision في متغير البيئة VITE_GOOGLE_VISION_API_KEY')
-        }
-        const response = await fetch(
-          `https://vision.googleapis.com/v1/images:annotate?key=${ocrApiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              requests: [
-                {
-                  image: { content: base64 },
-                  features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-                  imageContext: { languageHints: ['ar'] },
-                },
-              ],
-            }),
+      const base64 = await fileToBase64(file)
+      setOcrProgress(0)
+      const { data } = await Tesseract.recognize(`data:image/jpeg;base64,${base64}`, 'ara', {
+        logger: (message) => {
+          if (message.status === 'recognizing text' && typeof message.progress === 'number') {
+            setOcrProgress(Math.round(message.progress * 100))
           }
-        )
-
-        const payload = await response.json()
-        textResult =
-          payload?.responses?.[0]?.fullTextAnnotation?.text ||
-          payload?.responses?.[0]?.textAnnotations?.[0]?.description ||
-          ''
-      }
+        },
+      })
+      const textResult = data?.text || ''
 
       if (!textResult.trim()) {
         throw new Error('لم يتم العثور على نص واضح في الصورة')
       }
 
-      setText(textResult.trim())
+      const cleaned = textResult.trim()
+      setText(cleaned)
+      if (!title.trim()) {
+        setTitle(generateTitleSuggestion(cleaned))
+      }
+      if (!topic.trim()) {
+        setTopic(generateTopicSuggestion(cleaned))
+      }
       setOcrStatus('success')
+      setOcrProgress(null)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'حدث خطأ أثناء OCR'
       setOcrError(message)
       setOcrStatus('error')
+      setOcrProgress(null)
     }
+  }
+
+  const runOcr = async () => {
+    if (!sourceImageFile) return
+    await runOcrWithFile(sourceImageFile)
+  }
+
+  const generateTitleSuggestion = (value: string) => {
+    const firstLine = value.split('\n').map((line) => line.trim()).find(Boolean)
+    if (!firstLine) return 'فائدة جديدة'
+    return firstLine.length > 60 ? `${firstLine.slice(0, 60)}...` : firstLine
+  }
+
+  const generateTopicSuggestion = (value: string) => {
+    const lower = value.toLowerCase()
+    if (lower.includes('تربية') || lower.includes('أبناء') || lower.includes('تعليم')) {
+      return 'تربية'
+    }
+    if (lower.includes('إيمان') || lower.includes('عبادة') || lower.includes('قرآن')) {
+      return 'إيمانيات'
+    }
+    if (lower.includes('علم') || lower.includes('معرفة') || lower.includes('بحث')) {
+      return 'علم'
+    }
+    if (lower.includes('صحة') || lower.includes('بدن') || lower.includes('غذاء')) {
+      return 'صحة'
+    }
+    if (lower.includes('إدارة') || lower.includes('عمل') || lower.includes('قيادة')) {
+      return 'إدارة'
+    }
+    return 'غير مصنف'
   }
 
   const loginWithProvider = async (provider: 'google' | 'facebook') => {
@@ -488,6 +501,7 @@ function App() {
   }
 
   const isAuthenticated = Boolean(authUserEmail)
+  const userInitial = authUserName?.trim()?.charAt(0)?.toUpperCase() ?? '؟'
 
   return (
     <div className="app" dir="rtl" lang="ar">
@@ -578,217 +592,232 @@ function App() {
         </main>
       ) : (
         <>
-          <header className="hero">
-            <div>
-              <p className="eyebrow">دفتر الفوائد من الكتب</p>
-              <h1>اجمع فوائدك بسرعة ورتّبها حسب الموضوع</h1>
-              <p className="lead">
-                التقط صورة، حرر النص، أضف عنوانا وموضوعا، ثم احفظ كل فائدة في
-                مكان واحد.
-              </p>
+          <header className="navbar">
+            <div className="brand">
+              <span className="brand-mark">دفتر الفوائد</span>
+              <span className="brand-sub">إدارة فوائد الكتب</span>
             </div>
-            <div className="auth">
-              <span className="label">حسابك</span>
-              <div className="auth-user">
-                {authUserAvatar && (
-                  <img className="avatar" src={authUserAvatar} alt="user" />
-                )}
-                <div>
-                  <div className="user-name">{authUserName || 'مستخدم'}</div>
-                  <div className="hint">{authUserEmail}</div>
-                </div>
-                <button className="btn btn-ghost" onClick={logout}>
-                  تسجيل الخروج
-                </button>
+            <nav className="nav-links">
+              <NavLink className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`} to="/">
+                إضافة فائدة
+              </NavLink>
+              <NavLink className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`} to="/notes">
+                كل الفوائد
+              </NavLink>
+            </nav>
+            <div className="profile-card">
+              <div className="profile-meta">
+                <div className="profile-name">{authUserName || 'مستخدم'}</div>
+                <div className="profile-email">{authUserEmail}</div>
               </div>
+              {authUserAvatar ? (
+                <img className="avatar" src={authUserAvatar} alt="user" />
+              ) : (
+                <div className="avatar fallback">{userInitial}</div>
+              )}
+              <button className="btn btn-ghost" onClick={logout}>
+                تسجيل الخروج
+              </button>
             </div>
           </header>
 
-        <main className="grid">
-        <section className="panel">
-          <div className="section-title">1) التقاط المقطع</div>
-          <p className="muted">
-            افتح الكاميرا أو ارفع صورة لمقطع من كتاب، ثم ابدأ عملية استخراج
-            النص.
-          </p>
-          <div className="actions">
-            <label className="btn btn-primary">
-              فتح الكاميرا
-              <input
-                type="file"
-                accept="image/*"
-                capture="environment"
-                onChange={(event) => handleImagePick(event.target.files?.[0])}
-                hidden
-              />
-            </label>
-            <label className="btn btn-ghost">
-              رفع صورة
-              <input
-                type="file"
-                accept="image/*"
-                onChange={(event) => handleImagePick(event.target.files?.[0])}
-                hidden
-              />
-            </label>
-            <button
-              className="btn btn-outline"
-              type="button"
-              onClick={runOcr}
-              disabled={!sourceImageFile || ocrStatus === 'loading'}
-            >
-              {ocrStatus === 'loading' ? 'جاري الاستخراج...' : 'استخراج النص عبر OCR'}
-            </button>
-          </div>
-          {sourceImage && <div className="pill">آخر ملف: {sourceImage}</div>}
-          {ocrError && <div className="error">{ocrError}</div>}
-          {ocrStatus === 'success' && <div className="success">تم استخراج النص بنجاح.</div>}
-          {!ocrProxyUrl && !ocrApiKey && (
-            <p className="hint warn">
-              يفضّل تمرير OCR عبر سيرفر لحماية المفتاح. أضف VITE_OCR_PROXY_URL أو
-              VITE_GOOGLE_VISION_API_KEY.
-            </p>
-          )}
-        </section>
+          <Routes>
+            <Route
+              path="/"
+              element={
+                <main className="workspace">
+                  <section className="panel capture-panel">
+                <div className="section-title">التقاط المقطع</div>
+                <p className="muted">
+                  افتح الكاميرا أو ارفع صورة لمقطع من كتاب، ثم ابدأ عملية استخراج
+                  النص.
+                </p>
+                <div className="actions">
+                  <label className="btn btn-primary">
+                    فتح الكاميرا
+                    <input
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      onChange={(event) => handleImagePick(event.target.files?.[0])}
+                      hidden
+                    />
+                  </label>
+                  <label className="btn btn-ghost">
+                    رفع صورة
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(event) => handleImagePick(event.target.files?.[0])}
+                      hidden
+                    />
+                  </label>
+                  <button
+                    className="btn btn-outline"
+                    type="button"
+                    onClick={runOcr}
+                    disabled={!sourceImageFile || ocrStatus === 'loading'}
+                  >
+                    {ocrStatus === 'loading'
+                      ? 'جاري الاستخراج...'
+                      : 'استخراج النص عبر OCR'}
+                  </button>
+                </div>
+                {sourceImage && <div className="pill">آخر ملف: {sourceImage}</div>}
+                {ocrError && <div className="error">{ocrError}</div>}
+                {ocrStatus === 'success' && (
+                  <div className="success">تم استخراج النص بنجاح.</div>
+                )}
+                {ocrStatus === 'loading' && ocrProgress !== null && (
+                  <div className="hint">جاري التعرف على النص... {ocrProgress}%</div>
+                )}
+                  </section>
 
-        <section className="panel">
-          <div className="section-title">2) مراجعة النص</div>
-          <p className="muted">
-            النص المستخرج يظهر هنا لتصحيحه. يمكنك التعديل ثم حفظ الفائدة.
-          </p>
-          <label className="field">
-            <span>النص</span>
-            <textarea
-              className="textarea"
-              rows={8}
-              value={text}
-              onChange={(event) => setText(event.target.value)}
-              placeholder="أدخل النص هنا بعد استخراجه..."
+                  <section className="panel edit-panel">
+                <div className="section-title">تحرير وحفظ الفائدة</div>
+                <p className="muted">عدّل النص ثم أضف عنوانا وموضوعا للحفظ.</p>
+                <label className="field">
+                  <span>النص</span>
+                  <textarea
+                    className="textarea"
+                    rows={10}
+                    value={text}
+                    onChange={(event) => setText(event.target.value)}
+                    placeholder="أدخل النص هنا بعد استخراجه..."
+                  />
+                </label>
+                <div className="form-grid">
+                  <label className="field">
+                    <span>العنوان المقترح</span>
+                    <input
+                      className="input"
+                      value={title}
+                      onChange={(event) => setTitle(event.target.value)}
+                      placeholder="مثال: أثر الصحبة الصالحة"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>الموضوع</span>
+                    <input
+                      className="input"
+                      value={topic}
+                      onChange={(event) => setTopic(event.target.value)}
+                      placeholder="مثال: تربية"
+                    />
+                  </label>
+                </div>
+                <div className="actions">
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    onClick={saveNote}
+                    disabled={!canSave || saving}
+                  >
+                    {saving ? 'جارٍ الحفظ...' : draftId ? 'تحديث الفائدة' : 'حفظ الفائدة'}
+                  </button>
+                  <button className="btn btn-ghost" type="button" onClick={resetDraft}>
+                    تفريغ
+                  </button>
+                </div>
+                    {syncError && <div className="error">{syncError}</div>}
+                  </section>
+                </main>
+              }
             />
-          </label>
-        </section>
-
-        <section className="panel">
-          <div className="section-title">3) بيانات الفائدة</div>
-          <label className="field">
-            <span>العنوان</span>
-            <input
-              className="input"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="مثال: أثر الصحبة الصالحة"
-            />
-          </label>
-          <label className="field">
-            <span>الموضوع</span>
-            <input
-              className="input"
-              value={topic}
-              onChange={(event) => setTopic(event.target.value)}
-              placeholder="مثال: تربية"
-            />
-          </label>
-          <div className="actions">
-            <button
-              className="btn btn-primary"
-              type="button"
-              onClick={saveNote}
-              disabled={!canSave || saving}
-            >
-              {saving ? 'جارٍ الحفظ...' : draftId ? 'تحديث الفائدة' : 'حفظ الفائدة'}
-            </button>
-            <button className="btn btn-ghost" type="button" onClick={resetDraft}>
-              تفريغ
-            </button>
-          </div>
-          {syncError && <div className="error">{syncError}</div>}
-          <p className="hint">
-            يتم الحفظ في قاعدة البيانات الخاصة بحسابك.
-          </p>
-        </section>
-
-        <section className="panel wide">
-          <div className="section-title">4) كل الفوائد</div>
-          <div className="filter-row">
-            <span className="label">تصفية حسب الموضوع</span>
-            <div className="chips">
-              <button
-                className={`chip ${filter === 'الكل' ? 'active' : ''}`}
-                onClick={() => setFilter('الكل')}
-                type="button"
-              >
-                الكل
-              </button>
-              {topics.map((item) => (
-                <button
-                  key={item}
-                  className={`chip ${filter === item ? 'active' : ''}`}
-                  onClick={() => setFilter(item)}
-                  type="button"
-                >
-                  {item}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="notes">
-            {filteredNotes.length === 0 ? (
-              <div className="empty">
-                {loadingNotes ? 'جاري تحميل الفوائد...' : 'لا توجد فوائد بعد. ابدأ بإضافة فائدة.'}
-              </div>
-            ) : (
-              filteredNotes.map((note) => (
-                <article key={note.id} className="note">
-                  <div>
-                    <h3>{note.title}</h3>
-                    <p className="note-text">{note.text}</p>
-                    <div className="note-meta">
-                      <span>{note.topic}</span>
-                      <span>{new Date(note.createdAt).toLocaleString('ar')}</span>
-                    </div>
-                  </div>
-                  <div className="actions">
-                    <button className="btn btn-ghost" onClick={() => loadNote(note)}>
-                      فتح
-                    </button>
+            <Route
+              path="/notes"
+              element={
+                <main className="notes-page">
+                  <section className="panel wide">
+                <div className="section-title">تصفية الفوائد</div>
+                <div className="filter-row">
+                  <span className="label">تصفية حسب الموضوع</span>
+                  <div className="chips">
                     <button
-                      className="btn btn-outline"
-                      onClick={() => deleteNote(note.id)}
+                      className={`chip ${filter === 'الكل' ? 'active' : ''}`}
+                      onClick={() => setFilter('الكل')}
+                      type="button"
                     >
-                      حذف
+                      الكل
                     </button>
+                    {topics.map((item) => (
+                      <button
+                        key={item}
+                        className={`chip ${filter === item ? 'active' : ''}`}
+                        onClick={() => setFilter(item)}
+                        type="button"
+                      >
+                        {item}
+                      </button>
+                    ))}
                   </div>
-                </article>
-              ))
-            )}
-          </div>
-        </section>
+                </div>
+                  </section>
 
-        <section className="panel wide">
-          <div className="section-title">5) التصدير</div>
-          <p className="muted">
-            تصدير سريع بصيغ شائعة. قد تحتاج خطوط عربية مدمجة لتظهر بشكل ممتاز.
-          </p>
-          <div className="actions">
-            <button className="btn btn-primary" onClick={exportTxt}>
-              TXT
-            </button>
-            <button className="btn btn-outline" onClick={exportCsv}>
-              CSV (Excel)
-            </button>
-            <button className="btn btn-outline" onClick={exportJson}>
-              JSON
-            </button>
-            <button className="btn btn-outline" type="button" onClick={exportPdf}>
-              PDF
-            </button>
-            <button className="btn btn-outline" type="button" onClick={exportDocx}>
-              DOCX
-            </button>
-          </div>
-        </section>
-      </main>
+                  <section className="panel wide">
+                <div className="section-title">كل الفوائد</div>
+                <div className="notes">
+                  {filteredNotes.length === 0 ? (
+                    <div className="empty">
+                      {loadingNotes
+                        ? 'جاري تحميل الفوائد...'
+                        : 'لا توجد فوائد بعد. ابدأ بإضافة فائدة.'}
+                    </div>
+                  ) : (
+                    filteredNotes.map((note) => (
+                      <article key={note.id} className="note">
+                        <div>
+                          <h3>{note.title}</h3>
+                          <p className="note-text">{note.text}</p>
+                          <div className="note-meta">
+                            <span>{note.topic}</span>
+                            <span>{new Date(note.createdAt).toLocaleString('ar')}</span>
+                          </div>
+                        </div>
+                        <div className="actions">
+                          <button className="btn btn-ghost" onClick={() => loadNote(note)}>
+                            فتح
+                          </button>
+                          <button
+                            className="btn btn-outline"
+                            onClick={() => deleteNote(note.id)}
+                          >
+                            حذف
+                          </button>
+                        </div>
+                      </article>
+                    ))
+                  )}
+                </div>
+                  </section>
+
+                  <section className="panel wide">
+                <div className="section-title">التصدير</div>
+                <p className="muted">
+                  تصدير سريع بصيغ شائعة. قد تحتاج خطوط عربية مدمجة لتظهر بشكل ممتاز.
+                </p>
+                <div className="actions">
+                  <button className="btn btn-primary" onClick={exportTxt}>
+                    TXT
+                  </button>
+                  <button className="btn btn-outline" onClick={exportCsv}>
+                    CSV (Excel)
+                  </button>
+                  <button className="btn btn-outline" onClick={exportJson}>
+                    JSON
+                  </button>
+                  <button className="btn btn-outline" type="button" onClick={exportPdf}>
+                    PDF
+                  </button>
+                  <button className="btn btn-outline" type="button" onClick={exportDocx}>
+                    DOCX
+                  </button>
+                </div>
+                  </section>
+                </main>
+              }
+            />
+          </Routes>
         </>
       )}
     </div>
